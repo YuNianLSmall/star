@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>粒子星系 · WebGL + GLSL</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#04030a;overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;
+    color:#e8e6f5;-webkit-font-smoothing:antialiased}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+  #gl.dragging{cursor:grabbing}
+
+  .hud{position:fixed;top:26px;left:28px;z-index:10;pointer-events:none;
+    opacity:0;animation:fade .9s .3s ease forwards}
+  .hud h1{font-size:15px;font-weight:500;letter-spacing:.32em;color:rgba(232,230,245,.92)}
+  .hud p{margin-top:8px;font-size:11px;letter-spacing:.18em;color:rgba(150,140,200,.62)}
+
+  .panel{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:10;
+    width:min(880px,calc(100vw - 36px));padding:16px 22px 14px;
+    background:rgba(12,10,26,.58);border:1px solid rgba(150,130,220,.16);
+    border-radius:14px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    box-shadow:0 10px 40px rgba(0,0,0,.5);
+    opacity:0;animation:fade .9s .55s ease forwards}
+  .panel .row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+  .panel .title{font-size:11px;letter-spacing:.24em;color:rgba(160,148,210,.75);white-space:nowrap}
+  .btns{display:flex;gap:8px;flex-wrap:wrap}
+  .btns button{background:rgba(255,255,255,.05);border:1px solid rgba(160,140,230,.22);
+    color:rgba(226,222,245,.85);padding:6px 14px;border-radius:8px;font-size:12px;
+    letter-spacing:.06em;cursor:pointer;transition:background .2s,border-color .2s,color .2s;
+    font-family:inherit;white-space:nowrap}
+  .btns button:hover{background:rgba(150,120,230,.18);border-color:rgba(180,150,255,.45);color:#fff}
+  .btns button.off{opacity:.5}
+  .note{margin-top:11px;padding-top:11px;border-top:1px solid rgba(150,130,220,.12);
+    font-size:11.5px;line-height:1.72;color:rgba(178,172,205,.66);letter-spacing:.02em}
+  .note b{color:rgba(210,186,255,.9);font-weight:500}
+  .note em{font-style:normal;color:rgba(232,190,110,.85)}
+  @keyframes fade{to{opacity:1}}
+  @media (max-width:640px){
+    .panel{padding:12px 14px 11px;bottom:12px}
+    .note{font-size:10.5px;line-height:1.6}
+    .hud{top:18px;left:18px}
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="hud">
+  <h1>PARTICLE GALAXY</h1>
+  <p>WEBGL · GLSL · 12,000 STARS</p>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <span class="title">技术说明</span>
+    <div class="btns">
+      <button id="btnSpin">自转 开</button>
+      <button id="btnNebula">星云 开</button>
+      <button id="btnReset">重置视角</button>
+    </div>
+  </div>
+  <div class="note">
+    <b>纯 WebGL + GLSL</b> 实现，无任何第三方库。星系采用对数旋臂参数化，<b>12,000</b> 个顶点按
+    <b>4 条旋臂 + 核心球状晕</b> 分布；顶点着色器内用 <b>3D simplex noise</b> 做差速旋转与湍流位移，
+    再用<b>透视投影矩阵</b>把世界坐标映射到屏幕，点大小随深度衰减。
+    片元着色器用 <code>exp(-r²)</code> 绘制软辉光，叠加高频正弦实现<b>闪烁</b>；
+    颜色按半径做 <em>蓝紫核心 → 靛青 → 金色外缘</em> 的三段插值，并叠加噪声星云底图。
+    鼠标 / 触摸拖拽改变 yaw·pitch 并带惯性回落，滚轮缩放。
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ *
+   *  0. 上下文初始化
+   * ------------------------------------------------------------------ */
+  const canvas = document.getElementById("gl");
+  const gl = canvas.getContext("webgl", {
+    antialias: true,
+    alpha: false,
+    premultipliedAlpha: false,
+    powerPreference: "high-performance"
+  }) || canvas.getContext("experimental-webgl");
+
+  if (!gl) {
+    document.body.insertAdjacentHTML("beforeend",
+      '<div style="position:fixed;inset:0;display:grid;place-items:center;color:#aaa;font-size:14px;text-align:center;padding:24px">' +
+      '当前浏览器不支持 WebGL，无法渲染星系。</div>');
+    return;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  1. 着色器
+   * ------------------------------------------------------------------ */
+
+  // ---- 通用：3D simplex noise（Stefan Gustavson / Ashima Arts 经典实现）----
+  const NOISE_GLSL = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+             i.z + vec4(0.0, i1.z, i2.z, 1.0))
+           + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+           + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 105.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+float fbm(vec3 p){
+  float a = 0.5, s = 0.0;
+  for (int i = 0; i < 4; i++) {
+    s += a * snoise(p);
+    p *= 2.02;
+    a *= 0.5;
+  }
+  return s;
+}
+`;
+
+  // ---- 粒子：顶点着色器 ----
+  const VS_PARTICLE = `
+precision highp float;
+
+attribute vec3 aSeed;      // x: 归一化半径 t, y: 旋臂基准角, z: 随机种子
+attribute vec2 aMeta;      // x: 臂+晕混合权重, y: 尺寸倍率
+
+uniform mat4  uProj;
+uniform mat4  uView;
+uniform float uTime;
+uniform float uPixelRatio;
+uniform float uSpin;        // 自转累计角度
+
+varying vec3  vColor;
+varying float vAlpha;
+varying float vTwinkle;
+
+${NOISE_GLSL}
+
+  // 颜色：蓝紫核心 → 靛青中段 → 金色外缘
+  vec3 galaxyColor(float t){
+    vec3 cCore   = vec3(0.46, 0.52, 1.00);  // 冷蓝
+    vec3 cPurple = vec3(0.66, 0.40, 0.98);  // 蓝紫
+    vec3 cTeal   = vec3(0.50, 0.72, 0.94);  // 靛青过渡
+    vec3 cGold   = vec3(1.00, 0.80, 0.38);  // 金色
+    vec3 cAmber  = vec3(1.00, 0.64, 0.26);  // 外缘暖橙
+
+    vec3 c = mix(cCore, cPurple, smoothstep(0.0, 0.24, t));
+    c = mix(c, cTeal,   smoothstep(0.22, 0.46, t));
+    c = mix(c, cGold,   smoothstep(0.44, 0.74, t));
+    c = mix(c, cAmber,  smoothstep(0.74, 0.95, t));
+    return c;
+  }
+
+void main(){
+  float t     = aSeed.x;          // 0 核心 → 1 外缘
+  float armA  = aSeed.y;
+  float seed  = aSeed.z;
+  float mixW  = aMeta.x;          // 0 = 旋臂粒子, 1 = 核心晕粒子
+
+  float R = 0.05 + t * 1.62;      // 世界半径
+
+  // --- 对数旋臂：内紧外松 ---
+  float twist = 2.55 * log(1.0 + R * 2.2);
+  float angle = armA + twist;
+
+  // --- 差速旋转：内圈快、外圈慢（经典开普勒式近似）---
+  //     每颗星自身也带一点噪声相位，让旋臂"活着"
+  float speed = 0.55 / (0.45 + R * 1.15);
+  float nSpin = snoise(vec3(seed * 3.7, R * 1.4, uTime * 0.05)) * 0.10;
+  angle += uSpin * speed * (1.0 - mixW * 0.85) + nSpin;
+
+  // --- 3D simplex 湍流位移 ---
+  float nt = uTime * 0.16;
+  vec3 np = vec3(cos(angle) * R * 0.55, sin(angle) * R * 0.55, seed * 6.3 + nt);
+  vec3  flow = vec3(
+    snoise(np),
+    snoise(np + vec3(31.4, 7.3, 0.0)),
+    snoise(np + vec3(0.0, 19.1, 43.7))
+  );
+
+  float turbAmt = (0.035 + t * 0.075) * (1.0 - mixW * 0.55);
+  float radial  = 1.0 + flow.x * turbAmt * 1.6;
+  float angJit  = flow.y * turbAmt * 1.9;
+  float height  = flow.z * (0.018 + t * 0.052) * (1.0 - t * 0.35);
+
+  // 核心球状晕：不做旋臂，改成球面随机分布
+  vec3 pos;
+  if (mixW > 0.5) {
+    float ph = seed * 6.2831853;
+    float th = acos(2.0 * fract(seed * 7.31) - 1.0) * 0.5 + 0.35;
+    vec3 dir = vec3(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+    float rr = pow(fract(seed * 13.7), 0.62) * 0.72;
+    pos = dir * rr * (1.0 + flow.x * 0.18);
+    pos.xz *= 0.85;
+  } else {
+    float a2 = angle * radial + angJit;
+    float pR = R * radial;
+    pos = vec3(cos(a2) * pR, height, sin(a2) * pR);
+  }
+
+  // 盘面略微倾斜，观感更立体
+  float tilt = 0.18;
+  pos = vec3(pos.x, pos.y * cos(tilt) - pos.z * sin(tilt) * 0.0, pos.z);
+
+  vec4 mv = uView * vec4(pos, 1.0);
+  gl_Position = uProj * mv;
+
+  // --- 点大小：随深度衰减 + 闪烁呼吸 ---
+  float depth = max(-mv.z, 0.1);
+  float tw = 0.62 + 0.38 * sin(uTime * (1.6 + fract(seed * 17.3) * 4.2) + seed * 53.1);
+  tw *= 0.78 + 0.22 * snoise(vec3(seed * 21.0, uTime * 0.9, 0.0));
+  vTwinkle = clamp(tw, 0.15, 1.0);
+
+  float baseSize = mix(2.0, 1.1, t) * (0.55 + fract(seed * 91.7) * 0.9);
+  gl_PointSize = baseSize * aMeta.y * uPixelRatio * (7.2 / depth);
+  gl_PointSize = clamp(gl_PointSize, 0.7, 42.0 * uPixelRatio);
+
+  // --- 颜色 & 透明度 ---
+  vec3 col = galaxyColor(t);
+  // 核心添一点白热感
+  col += vec3(0.45, 0.40, 0.55) * smoothstep(0.20, 0.0, t) * 0.55;
+  vColor = col;
+
+  float a = mix(0.95, 0.55, t);
+  a *= 1.0 - mixW * 0.35;
+  a *= smoothstep(0.0, 0.12, t + 0.06);      // 内缘柔化
+  vAlpha = clamp(a, 0.0, 1.0);
+}
+`;
+
+  // ---- 粒子：片元着色器 ----
+  const FS_PARTICLE = `
+precision highp float;
+
+varying vec3  vColor;
+varying float vAlpha;
+varying float vTwinkle;
+
+void main(){
+  vec2 uv = gl_PointCoord * 2.0 - 1.0;
+  float d2 = dot(uv, uv);
+  if (d2 > 1.0) discard;
+
+  float core = exp(-d2 * 7.0);          // 实心核
+  float halo = exp(-d2 * 2.2) * 0.55;   // 外辉光
+  float a = (core + halo) * vAlpha;
+
+  // 闪烁时略微偏向白热，模拟真实星点闪烁
+  vec3 col = mix(vColor, vec3(1.0), core * vTwinkle * 0.45);
+  col *= 0.85 + 0.55 * vTwinkle;
+
+  gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
+}
+`;
+
+  // ---- 背景：全屏三角，星云 + 静态星野 ----
+  const VS_BG = `
+precision highp float;
+attribute vec2 aPos;
+varying vec2 vUv;
+void main(){
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+`;
+
+  const FS_BG = `
+precision highp float;
+varying vec2 vUv;
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uNebula;   // 0..1 星云开关
+
+${NOISE_GLSL}
+
+// 廉价 hash 星野
+float hash21(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float starField(vec2 uv, float density, float thresh){
+  vec2 g = uv * density;
+  vec2 id = floor(g);
+  vec2 f = fract(g) - 0.5;
+  float h = hash21(id);
+  if (h < thresh) return 0.0;
+  float off = hash21(id + 7.13) - 0.5;
+  vec2 p = f - vec2(off * 0.8, (hash21(id + 3.7) - 0.5) * 0.8);
+  float d = length(p);
+  float tw = 0.55 + 0.45 * sin(uTime * (0.6 + h * 2.4) + h * 90.0);
+  return exp(-d * d * 190.0) * tw * (h - thresh) / (1.0 - thresh);
+}
+
+void main(){
+  vec2 uv = vUv;
+  float aspect = uRes.x / uRes.y;
+  vec2 p = vec2((uv.x - 0.5) * aspect, uv.y - 0.5);
+
+  // 深空底色：极暗的蓝紫，带垂直渐变
+  vec3 col = mix(vec3(0.012, 0.010, 0.030), vec3(0.030, 0.016, 0.052), uv.y);
+  col += vec3(0.010, 0.006, 0.024) * smoothstep(0.9, 0.0, length(p));
+
+  // 星云：两层 fbm 缓慢流动
+  vec3 q = vec3(p * 1.9, uTime * 0.012);
+  float n1 = fbm(q);
+  float n2 = fbm(q * 2.3 + vec3(4.0, 2.0, -1.5) + uTime * 0.008);
+  float neb = smoothstep(-0.15, 0.95, n1 * 0.75 + n2 * 0.45);
+  neb *= uNebula;
+
+  vec3 nebCol = mix(vec3(0.10, 0.06, 0.32), vec3(0.32, 0.14, 0.42), smoothstep(0.2, 0.9, n2));
+  nebCol = mix(nebCol, vec3(0.55, 0.32, 0.14), smoothstep(0.55, 1.0, n1) * 0.55);
+  col += nebCol * neb * 0.22;
+
+  // 两层星野（不同密度/阈值 → 远近层次）
+  col += vec3(0.80, 0.84, 1.00) * starField(uv * vec2(aspect, 1.0), 190.0, 0.982) * 0.85;
+  col += vec3(0.95, 0.90, 0.86) * starField(uv * vec2(aspect, 1.0) + 0.37, 95.0, 0.992) * 1.15;
+
+  // 暗角
+  float vig = smoothstep(1.15, 0.28, length(p));
+  col *= 0.42 + 0.58 * vig;
+
+  // 极轻微抖动，消除色带
+  col += (hash21(gl_FragCoord.xy) - 0.5) * 0.006;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+  /* ------------------------------------------------------------------ *
+   *  2. WebGL 工具函数
+   * ------------------------------------------------------------------ */
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s), "\n", src.split("\n").map((l, i) => (i + 1) + ": " + l).join("\n"));
+      throw new Error("Shader compile failed");
+    }
+    return s;
+  }
+
+  function program(vsSrc, fsSrc) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(p));
+      throw new Error("Program link failed");
+    }
+    // 收集 uniform / attribute 位置
+    p.u = {};
+    p.a = {};
+    const nu = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < nu; i++) {
+      const info = gl.getActiveUniform(p, i);
+      p.u[info.name.replace("[0]", "")] = gl.getUniformLocation(p, info.name);
+    }
+    const na = gl.getProgramParameter(p, gl.ACTIVE_ATTRIBUTES);
+    for (let i = 0; i < na; i++) {
+      const info = gl.getActiveAttrib(p, i);
+      p.a[info.name] = gl.getAttribLocation(p, info.name);
+    }
+    return p;
+  }
+
+  const progs = {
+    bg: program(VS_BG, FS_BG),
+    particle: program(VS_PARTICLE, FS_PARTICLE)
+  };
+
+  /* ------------------------------------------------------------------ *
+   *  3. 几何数据生成
+   * ------------------------------------------------------------------ */
+  const NUM_PARTICLES = 12000;   // 旋臂粒子
+  const NUM_HALO      = 2200;    // 核心球状晕
+  const TOTAL         = NUM_PARTICLES + NUM_HALO;
+  const ARMS          = 4;
+
+  // 简易可复现随机（mulberry32）
+  function makeRng(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const seedBuf   = new Float32Array(TOTAL * 3);  // t, armAngle, seed
+  const metaBuf   = new Float32Array(TOTAL * 2);  // mixW, sizeMul
+
+  function buildGalaxy(seedVal) {
+    const rnd = makeRng(seedVal);
+
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+      const r = rnd();
+      // 半径分布：向内集中（幂次 1.7），外缘稀疏拉出长尾
+      const t = Math.pow(r, 1.7) * 0.86 + rnd() * 0.14;
+
+      const arm = Math.floor(rnd() * ARMS);
+      const armAngle = (arm / ARMS) * Math.PI * 2;
+
+      // 旋臂宽度随半径张开
+      const spread = (rnd() + rnd() + rnd() - 1.5) * (0.30 + t * 0.55);
+
+      seedBuf[i * 3 + 0] = t;
+      seedBuf[i * 3 + 1] = armAngle + spread;
+      seedBuf[i * 3 + 2] = rnd() * 97.0 + 1.0;
+
+      metaBuf[i * 2 + 0] = 0.0;
+      metaBuf[i * 2 + 1] = 0.75 + rnd() * 0.65;
+    }
+
+    for (let i = 0; i < NUM_HALO; i++) {
+      const k = NUM_PARTICLES + i;
+      const t = Math.pow(rnd(), 2.2) * 0.22;   // 全在核心区
+      seedBuf[k * 3 + 0] = t;
+      seedBuf[k * 3 + 1] = rnd() * Math.PI * 2;
+      seedBuf[k * 3 + 2] = rnd() * 97.0 + 1.0;
+
+      metaBuf[k * 2 + 0] = 1.0;
+      metaBuf[k * 2 + 1] = 0.7 + rnd() * 0.8;
+    }
+  }
+  buildGalaxy(20261017);
+
+  // 上传到 GPU
+  const particleVAO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, particleVAO);
+  gl.bufferData(gl.ARRAY_BUFFER, seedBuf, gl.STATIC_DRAW);
+
+  const metaVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, metaVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, metaBuf, gl.STATIC_DRAW);
+
+  // 背景全屏三角
+  const bgVBO = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+
+  /* ------------------------------------------------------------------ *
+   *  4. 矩阵数学（列主序 4x4）
+   * ------------------------------------------------------------------ */
+  function perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+      f / aspect, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, (far + near) * nf, -1,
+      0, 0, 2 * far * near * nf, 0
+    ]);
+  }
+
+  function lookAt(eye, center, up) {
+    let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+    let len = Math.hypot(zx, zy, zz) || 1;
+    zx /= len; zy /= len; zz /= len;
+
+    let xx = up[1] * zz - up[2] * zy;
+    let xy = up[2] * zx - up[0] * zz;
+    let xz = up[0] * zy - up[1] * zx;
+    len = Math.hypot(xx, xy, xz) || 1;
+    xx /= len; xy /= len; xz /= len;
+
+    const yx = zy * xz - zz * xy;
+    const yy = zz * xx - zx * xz;
+    const yz = zx * xy - zy * xx;
+
+    return new Float32Array([
+      xx, yx, zx, 0,
+      xy, yy, zy, 0,
+      xz, yz, zz, 0,
+      -(xx * eye[0] + xy * eye[1] + xz * eye[2]),
+      -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
+      -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
+      1
+    ]);
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  5. 交互状态
+   * ------------------------------------------------------------------ */
+  const state = {
+    yaw: 0,
+    pitch: 0.62,          // 初始略微俯视，看清盘面
+    yawV: 0,
+    pitchV: 0,
+    dist: 4.6,
+    targetDist: 4.6,
+    dragging: false,
+    spin: 1,              // 1 自转 / 0 暂停（平滑过渡）
+    spinAmt: 0,
+    nebula: 1,
+    nebulaAmt: 1,
+    lastX: 0,
+    lastY: 0,
+    idle: 0               // 无操作时长，用于自动回落
+  };
+
+  const PITCH_MIN = -1.42, PITCH_MAX = 1.42;
+
+  function pointerDown(x, y) {
+    state.dragging = true;
+    state.lastX = x; state.lastY = y;
+    state.yawV = 0; state.pitchV = 0;
+    state.idle = 0;
+    canvas.classList.add("dragging");
+  }
+
+  function pointerMove(x, y) {
+    if (!state.dragging) return;
+    const dx = x - state.lastX;
+    const dy = y - state.lastY;
+    state.lastX = x; state.lastY = y;
+
+    const k = 0.0055;
+    state.yaw   -= dx * k;
+    state.pitch -= dy * k;
+    state.pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, state.pitch));
+
+    // 记录角速度用于松手后的惯性
+    state.yawV   = -dx * k;
+    state.pitchV = -dy * k;
+    state.idle = 0;
+  }
+
+  function pointerUp() {
+    state.dragging = false;
+    canvas.classList.remove("dragging");
+  }
+
+  canvas.addEventListener("mousedown", e => pointerDown(e.clientX, e.clientY));
+  window.addEventListener("mousemove", e => pointerMove(e.clientX, e.clientY));
+  window.addEventListener("mouseup", pointerUp);
+
+  canvas.addEventListener("touchstart", e => {
+    const t = e.touches[0];
+    pointerDown(t.clientX, t.clientY);
+  }, { passive: true });
+  canvas.addEventListener("touchmove", e => {
+    const t = e.touches[0];
+    pointerMove(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive: false });
+  canvas.addEventListener("touchend", pointerUp);
+  canvas.addEventListener("touchcancel", pointerUp);
+
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    state.targetDist = Math.max(2.4, Math.min(9.0, state.targetDist + e.deltaY * 0.0022));
+    state.idle = 0;
+  }, { passive: false });
+
+  // 双击 → 重置视角
+  canvas.addEventListener("dblclick", resetView);
+
+  function resetView() {
+    state.yaw = 0;
+    state.pitch = 0.62;
+    state.yawV = 0;
+    state.pitchV = 0;
+    state.targetDist = 4.6;
+  }
+
+  /* 按钮 */
+  const btnSpin = document.getElementById("btnSpin");
+  const btnNebula = document.getElementById("btnNebula");
+  const btnReset = document.getElementById("btnReset");
+
+  btnSpin.addEventListener("click", () => {
+    state.spin = state.spin > 0.5 ? 0 : 1;
+    btnSpin.textContent = state.spin > 0.5 ? "自转 开" : "自转 关";
+    btnSpin.classList.toggle("off", state.spin < 0.5);
+  });
+
+  btnNebula.addEventListener("click", () => {
+    state.nebula = state.nebula > 0.5 ? 0 : 1;
+    btnNebula.textContent = state.nebula > 0.5 ? "星云 开" : "星云 关";
+    btnNebula.classList.toggle("off", state.nebula < 0.5);
+  });
+
+  btnReset.addEventListener("click", resetView);
+
+  /* ------------------------------------------------------------------ *
+   *  6. 渲染循环
+   * ------------------------------------------------------------------ */
+  let dpr = 1;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.floor(canvas.clientWidth * dpr);
+    const h = Math.floor(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+  }
+
+  let startTime = performance.now();
+  let prevT = startTime;
+  let smoothSpin = 0;
+
+  function frame(now) {
+    const dt = Math.min((now - prevT) / 1000, 0.05);
+    prevT = now;
+    const time = (now - startTime) / 1000;
+
+    resize();
+    const W = canvas.width, H = canvas.height;
+
+    /* --- 相机阻尼与惯性 --- */
+    if (!state.dragging) {
+      // 惯性衰减
+      state.yaw   += state.yawV;
+      state.pitch += state.pitchV;
+      state.yawV   *= 0.94;
+      state.pitchV *= 0.94;
+      if (Math.abs(state.yawV) < 1e-5) state.yawV = 0;
+      if (Math.abs(state.pitchV) < 1e-5) state.pitchV = 0;
+      state.pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, state.pitch));
+
+      // 闲置后缓慢自动环绕，让画面保持生命感
+      state.idle += dt;
+      if (state.idle > 3.2) {
+        const k = Math.min((state.idle - 3.2) / 2.5, 1);
+        state.yaw += dt * 0.055 * k;
+        // 俯仰缓缓回到 0.55
+        state.pitch += (0.55 - state.pitch) * dt * 0.22 * k;
+      }
+    }
+    state.dist += (state.targetDist - state.dist) * Math.min(dt * 6, 1);
+
+    // 自转 / 星云的平滑开关
+    smoothSpin += ((state.spin ? 1 : 0) - smoothSpin) * Math.min(dt * 2.2, 1);
+    state.spinAmt += dt * 0.26 * smoothSpin;   // 累计自转角度
+    state.nebulaAmt += ((state.nebula ? 1 : 0) - state.nebulaAmt) * Math.min(dt * 2.6, 1);
+
+    /* --- 相机 --- */
+    const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
+    const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+    const dir = [sy * cp, sp, cy * cp];
+    const eye = [dir[0] * state.dist, dir[1] * state.dist, dir[2] * state.dist];
+
+    const proj = perspective(52 * Math.PI / 180, W / H, 0.1, 100);
+    const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+
+    /* --- 1) 背景 --- */
+    gl.viewport(0, 0, W, H);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progs.bg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
+    gl.enableVertexAttribArray(progs.bg.a.aPos);
+    gl.vertexAttribPointer(progs.bg.a.aPos, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform2f(progs.bg.u.uRes, W, H);
+    gl.uniform1f(progs.bg.u.uTime, time);
+    gl.uniform1f(progs.bg.u.uNebula, state.nebulaAmt);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disableVertexAttribArray(progs.bg.a.aPos);
+
+    /* --- 2) 粒子（叠加混合）--- */
+    const P = progs.particle;
+    gl.useProgram(P);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleVAO);
+    gl.enableVertexAttribArray(P.a.aSeed);
+    gl.vertexAttribPointer(P.a.aSeed, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, metaVBO);
+    gl.enableVertexAttribArray(P.a.aMeta);
+    gl.vertexAttribPointer(P.a.aMeta, 2, gl.FLOAT, false, 0, 0);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);   // 加性混合，星点自然发光
+
+    gl.uniformMatrix4fv(P.u.uProj, false, proj);
+    gl.uniformMatrix4fv(P.u.uView, false, view);
+    gl.uniform1f(P.u.uTime, time);
+    gl.uniform1f(P.u.uPixelRatio, dpr);
+    gl.uniform1f(P.u.uSpin, state.spinAmt);
+
+    gl.drawArrays(gl.POINTS, 0, TOTAL);
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+
+  // 页面隐藏时重置计时，避免回来时 dt 突变
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) prevT = performance.now();
+  });
+})();
+</script>
+</body>
+</html>
